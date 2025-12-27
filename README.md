@@ -221,6 +221,6 @@ curl "https://your-worker-subdomain.workers.dev?url=https://httpbin.org/cookies/
 ---
 
 **附录：完整 Worker 代码**  
-[点击此处获取最新代码](https://github.com/The-cute-cat/Cloudflare-Worker-CORS)  
+[点击此处获取最新代码](https://codeload.github.com/The-cute-cat/Cloudflare-Worker-CORS/zip/refs/heads/master)  
 
 > 部署前请务必阅读 [Cloudflare 服务条款](https://www.cloudflare.com/terms/) 和 [Acceptable Use Policy](https://www.cloudflare.com/website-terms/)。
