@@ -1,6 +1,6 @@
 # Cloudflare Worker 通用 CORS 代理  
 
-**版本：** 1.3  
+**版本：** 1.3.1  
 **最后更新：** 2026年10月24日  
 
 ---
@@ -25,7 +25,8 @@
 | ----------------- | ------------------------------------------------------------ |
 | **CORS 完全支持** | 自动注入标准 CORS 响应头，允许所有域访问 (`Access-Control-Allow-Origin: *`) |
 | **智能重定向**    | 手动处理 3xx 重定向，最多跟随 10 次，记录最终 URL 和重定向次数 |
-| **Cookie 隧道**   | 通过 `X-Forwarded-Cookie` 和 `X-Set-Cookie` 头实现跨域 Cookie 透传 |
+| **Cookie 隧道**   | 通过 `X-Forwarded-Cookie` 和 `X-Set-Cookie` 头实现跨域 Cookie 透传，并按源隔离以防跨域泄漏 |
+| **递归保护**      | 按解析后的 hostname 精确拦截"代理调用自己"，不会误杀 query 里含代理域名的正常请求 |
 | **Referer 伪装**  | 自动将 Referer 设置为目标域名的根路径，绕过防盗链            |
 | **安全过滤**      | 仅允许 HTTP/HTTPS 协议，过滤危险请求头（Host/Origin/Cookie/身份 IP 头），剥离上游 `access-control-*` |
 | **目标白名单**    | 可选，由环境变量 `ALLOWED_TARGETS` 控制，**默认不限制**任意目标域名 |
@@ -79,7 +80,7 @@ ALLOWED_TARGETS = ["api.example.com", "data.trusted-domain.org"]
 # ALLOWED_TARGETS = "api.example.com,data.trusted-domain.org"
 ```
 
-也可以直接在 Dashboard → Workers → 你的 Worker → **Settings → Variables** 中新增该变量，改完即时生效，无需改代码。
+也可以直接在 Dashboard → Workers → 你的 Worker → **Settings → Variables** 中新增该变量，改完即时生效，无需改代码。仓库本身不附带 `wrangler.toml`（本项目按单文件 Worker 部署，用 Dashboard 或自建 `wrangler.toml` 均可），上面的 `[vars]` 片段是给自建配置用的。
 
 匹配规则：
 
@@ -210,12 +211,14 @@ curl "https://your-worker-subdomain.workers.dev?url=https://httpbin.org/cookies/
 ### ⚠️ 重要限制  
 
 - **流式与大文件**：响应体以流的形式透传，SSE / 长连接流式输出正常，大文件（实测 10MB）可完整下载；真正的限制是 Worker 的 CPU 时间与单请求超时，而不是 body 大小
-- **不支持 Range 分段下载**：上游的 `Content-Range` 会透传，但 `Content-Length` 被剥离后由运行时重新计算，断点续传 / 视频拖动的行为取决于上游与客户端，不建议依赖
+- **不支持 Range 分段下载**：上游的 `Content-Range` 会透传，但有 body 的响应其 `Content-Length` 由运行时按实际字节重算（只有 `HEAD` 保留上游值），断点续传 / 视频拖动的行为取决于上游与客户端，不建议依赖
+- **请求体是整体缓冲的**：为支持重定向复用 body，请求体会先 `arrayBuffer()` 读入内存，因此大文件上传不支持流式，且受 Worker 128MB 内存上限约束
+- **UA / Accept 固定为浏览器值**：为保证"浏览器伪装"，`User-Agent`、`Accept` 等头由代理强制写入，客户端自定义的同类头不会透传；如需按 UA 放行的 API，请自行调整代码里的 `skipHeaders`
 - **目标可达性取决于出口 IP**：代理出口是 Cloudflare 的 IP 段，目标站点若封禁 Cloudflare 或做反爬（403/412/503），本代理同样访问不到
-- **客户端 IP 会暴露给上游**：`CF-Connecting-IP` 等由边缘注入，Worker 侧过滤无法保证完全剥离，敏感场景不要把它当匿名通道
+- **客户端 IP 会暴露给上游**：`CF-Connecting-IP` 已在 Worker 侧过滤；但 `CF-Ray` / `CF-Visitor` / `CF-Ew-Via` / `CF-Worker` / `CDN-Loop` 由边缘为子请求重新生成，无法剥离（它们不含客户端 IP，仅暴露代理身份）
 - **Cookie 作用域**：  
   - 代理不会自动设置浏览器 Cookie（需客户端手动处理 `X-Set-Cookie`）  
-  - 仅在**同源重定向**链内延续 Cookie，跨域跳转时不会把上一站的 Cookie 带给新域名  
+  - Cookie **按源（origin）隔离**：每个源只会收到客户端指定给它的（`X-Forwarded-Cookie`）以及它自己下发过的 Cookie，跨域重定向不会把上一站的凭证带给新域名  
   - 仅支持第一方 Cookie，第三方 Cookie 可能被浏览器拦截  
 - **协议限制**：仅支持 `http`/`https`，**不支持** `ftp`/`ws`/`file` 等协议  
 - **超时限制**：Cloudflare Worker 默认 100 秒超时（[企业计划](https://www.cloudflare.com/plans/developer-platform/) 可延长）  

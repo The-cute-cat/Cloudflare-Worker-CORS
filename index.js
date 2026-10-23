@@ -51,11 +51,22 @@ export default {
         const url = new URL(request.url);
         const target = url.searchParams.get('url');
 
-        if (target && target.includes('cors-proxy-worker.hopecat.dpdns.org')) {
-            return new Response('Detected Recursive Proxy Loop', {
-                status: 403,
-                headers: corsHeaders
-            });
+        // 2.5 递归调用检测：比对解析后的 hostname，而不是对整个 URL 字符串做 includes，
+        // 否则目标 URL 的 query/path 里恰好含本代理域名时会被误判。
+        const selfHost = url.hostname.toLowerCase();
+        if (target) {
+            let recurseProbe = null;
+            try {
+                recurseProbe = new URL(target);
+            } catch (err) {
+                // 非法 URL 交给下面的 400 分支处理
+            }
+            if (recurseProbe && recurseProbe.hostname.toLowerCase() === selfHost) {
+                return new Response('Detected Recursive Proxy Loop', {
+                    status: 403,
+                    headers: corsHeaders
+                });
+            }
         }
 
         // 3. 检查目标 URL 参数
@@ -94,7 +105,14 @@ export default {
             let redirectCount = 0;
             let finalResponse = null;
             const allSetCookies = [];
-            let clientCookie = request.headers.get('X-Forwarded-Cookie') || '';
+
+            // Cookie 按源（origin）隔离：某个源只会收到它自己下发/客户端指定给它的 Cookie，
+            // 跨域重定向时不会把上一站的凭证带给新域名。
+            const cookieJar = new Map();
+            const initialCookie = request.headers.get('X-Forwarded-Cookie') || '';
+            if (initialCookie) {
+                cookieJar.set(parsedTarget.origin, initialCookie);
+            }
 
             // 请求体只读一次：流被 body 消费后无法在重定向循环中复用
             const hasBody = !['GET', 'HEAD'].includes(request.method);
@@ -135,14 +153,9 @@ export default {
                 proxyHeaders.set('Sec-Fetch-User', '?1');
                 proxyHeaders.set('Upgrade-Insecure-Requests', '1');
 
-                // ✅ 伪装 Referer 为完整的目标 URL（更好伪装）
+                // ✅ 伪装 Referer 为目标站根路径（防防盗链，Origin 则被丢弃）
+                // Host 由 new Request(url) 的 URL 自动决定，无需也无法手动设置
                 proxyHeaders.set('Referer', currentParsed.origin + '/');
-
-                // ✅ 设置正确的 Host
-                proxyHeaders.set('Host', currentParsed.host);
-
-                // ✅ 设置 Connection
-                proxyHeaders.set('Connection', 'keep-alive');
 
                 // 复制客户端自定义请求头（排除敏感头）
                 const skipHeaders = [
@@ -154,7 +167,9 @@ export default {
                     'upgrade-insecure-requests',
                     // 隧道专用头，不应泄漏给上游
                     'x-forwarded-cookie',
-                    // 客户端身份/来源 IP 相关头，不透传给上游
+                    // 客户端身份/来源 IP 相关头，不透传给上游。
+                    // 注意：cf-ray / cf-visitor / cf-ew-via / cf-worker / cdn-loop 由边缘为
+                    // 每个子请求重新生成，这里只是尽力而为，实际可能仍会出现在上游请求里。
                     'x-forwarded-for', 'x-real-ip', 'forwarded', 'true-client-ip',
                     'cf-connecting-ip', 'cf-worker', 'cf-ray', 'cf-visitor', 'cf-ew-via',
                     'cdn-loop',
@@ -166,9 +181,10 @@ export default {
                     }
                 }
 
-                // 添加客户端 Cookie（通过 X-Forwarded-Cookie 传入）
-                if (clientCookie) {
-                    proxyHeaders.set('Cookie', clientCookie);
+                // 添加该源自己的 Cookie（来自 X-Forwarded-Cookie 或前序同源响应）
+                const hopCookie = cookieJar.get(currentParsed.origin);
+                if (hopCookie) {
+                    proxyHeaders.set('Cookie', hopCookie);
                 }
 
                 // 发起请求（手动处理重定向）
@@ -188,8 +204,14 @@ export default {
                     if (sc) setCookies.push(sc);
                 }
 
-                for (const cookie of setCookies) {
-                    allSetCookies.push(cookie);
+                if (setCookies.length > 0) {
+                    for (const cookie of setCookies) {
+                        allSetCookies.push(cookie);
+                    }
+                    // 只回写给下发这些 Cookie 的那个源
+                    const jar = cookieJar.get(currentParsed.origin) || '';
+                    const added = setCookies.map(cookie => cookie.split(';')[0]).filter(Boolean).join('; ');
+                    cookieJar.set(currentParsed.origin, jar ? `${jar}; ${added}` : added);
                 }
 
                 // 检查是否为重定向
@@ -202,13 +224,8 @@ export default {
 
                     try {
                         const redirectUrl = new URL(location, currentUrl);
-                        // 仅在同一源内延续 Cookie，跨域重定向时不得把上一站的 Cookie 送给新域名
-                        if (redirectUrl.origin === currentParsed.origin) {
-                            for (const cookie of setCookies) {
-                                const kv = cookie.split(';')[0];
-                                clientCookie = clientCookie ? `${clientCookie}; ${kv}` : kv;
-                            }
-                        }
+                        // Cookie 已按源存放在 cookieJar 中，跨域跳转时新域名取不到上一站的 Cookie，
+                        // 因此这里无需特殊处理，正常推进即可。
                         currentUrl = redirectUrl.href;
                         redirectCount++;
                         continue;
@@ -238,12 +255,18 @@ export default {
             const responseHeaders = new Headers();
 
             // 复制响应头，但跳过某些头
-            // access-control-* 全部跳过：CORS 头统一由本代理重写，
-            // 否则上游的 access-control-allow-credentials: true 会与 ACAO:* 组成非法组合，浏览器直接拒绝。
-            const skipResponseHeaders = ['set-cookie', 'content-encoding', 'content-length', 'transfer-encoding'];
+            // - access-control-*：CORS 头统一由本代理重写，否则上游的
+            //   access-control-allow-credentials: true 会与 ACAO:* 组成非法组合，浏览器直接拒绝。
+            // - content-length：有 body 时交给运行时按实际字节数计算，避免压缩/解压后长度不符；
+            //   HEAD 没有 body，运行时无从重算，保留上游值以便客户端"先探大小"。
+            const skipResponseHeaders = ['set-cookie', 'content-encoding', 'transfer-encoding'];
+            const keepContentLength = request.method === 'HEAD';
             for (const [key, value] of finalResponse?.headers.entries()) {
                 const lowerKey = key.toLowerCase();
                 if (skipResponseHeaders.includes(lowerKey) || lowerKey.startsWith('access-control-')) {
+                    continue;
+                }
+                if (lowerKey === 'content-length' && !keepContentLength) {
                     continue;
                 }
                 responseHeaders.set(key, value);
